@@ -12,7 +12,7 @@ This API serves three catalogs from one backend:
 
 It is built for apps and websites. This guide documents every endpoint and also shows **how the official YOCINEMA Android app uses it**, so you can copy a flow that is known to work.
 
-> The translated catalog is a separate API with its own documentation at developer.yocinema.dpdns.org. Nothing here applies to it.
+> The translated catalog is a separate API with its own documentation at `https://developer.yocinema.dpdns.org` . Nothing here applies to it.
 
 ---
 
