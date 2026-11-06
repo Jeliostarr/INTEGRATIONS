@@ -12,7 +12,9 @@ This API serves three catalogs from one backend:
 
 It is built for apps and websites. This guide documents every endpoint and also shows **how the official YOCINEMA Android app uses it**, so you can copy a flow that is known to work.
 
-> The translated catalog is a separate API with its own documentation at `https://developer.yocinema.dpdns.org` . Nothing here applies to it.
+> **Read this first:** never put your API key in a website's JavaScript or in an app you distribute. Anyone can copy it and spend your quota. Put a small gateway in front of the API instead: see [Protect your API key](#protect-your-api-key) and the companion guide **PROTECT_YOUR_API_KEY.md** (ready-to-deploy Cloudflare Worker code and free alternatives).
+
+> The translated catalog is a separate API with its own documentation. Nothing here applies to it.
 
 ---
 
@@ -20,7 +22,7 @@ It is built for apps and websites. This guide documents every endpoint and also 
 
 1. [Getting access](#getting-access)
 2. [Authentication & errors](#authentication--errors)
-3. [Apps vs websites](#apps-vs-websites)
+3. [Protect your API key](#protect-your-api-key)
 4. [Hosts you will see](#hosts-you-will-see)
 5. [How the official app uses the API](#how-the-official-app-uses-the-api)
 6. [Endpoint reference: movies & TV](#endpoint-reference-movies--tv)
@@ -37,9 +39,9 @@ It is built for apps and websites. This guide documents every endpoint and also 
 ## Getting access
 
 1. **Create an API key** in the dashboard: <https://dash.yocinema.dpdns.org>
-2. **Ask for non-translated/Nigerian access to be enabled on that key.** It is off by default. Message us on [Telegram](https://t.me/jeliostarrdev) or [WhatsApp](https://wa.me/256707934960) and we'll switch it on for free.
+2. **Use it.** New keys can normally use this API straight away.
 
-Until step 2 is done, every request returns `403` with the message *"not enabled for movies-demo access"* (see [errors](#authentication--errors)).
+If a request returns `403` with *"not enabled for movies-demo access"*, your key isn't switched on for this catalog yet. Message us on [Telegram](https://t.me/jeliostarrdev) or [WhatsApp](https://wa.me/256707934960) and we'll enable it for free.
 
 ---
 
@@ -74,29 +76,41 @@ Be defensive when parsing: read `error`, then fall back to `message`, then to `d
 | 403 | `inactive` | Account inactive | Contact support |
 | 403 | `Origin not allowed` | Browser origin not allow-listed | See [websites](#apps-vs-websites) |
 | 429 | | Daily request limit reached | Wait for reset or upgrade |
+| 429 | *(from a media link)* | That link was used too often or from too many places | Request a fresh link from the API. Don't share links. |
+| 503 | `Verification busy` | Our key check is briefly overloaded | Retry after the `Retry-After` seconds |
 | 400 | | Bad or missing parameter | Fix the request |
 | 404 | | Title / event / video not found | Show "not available" |
-| 502 / 504 | | Upstream failure or timeout | Retry with backoff |
+| 502 / 504 | | Temporary failure or timeout | Retry with backoff |
 | 500 | | Unexpected error | Retry once, then report |
 
 Match on **status first, then message text**. The message text is the only way to tell the 403 reasons apart.
 
 ---
 
-## Apps vs websites
+## Protect your API key
 
-### Native apps (Android, iOS)
+Your API key is a credential. If it ends up in a browser page or an app package, anyone can copy it, spend your daily quota and get **your** key suspended. Follow these rules:
 
-Call the API directly with `X-API-Key`. Native requests carry no browser `Origin` header, so there is nothing to allow-list. Don't hardcode a key in a publicly distributed app. Have the user sign in with their own key (as the official app does) or route through your own server.
+| Do | Don't |
+|---|---|
+| Keep the key on a server you control (a **gateway**) | Put the key in website JavaScript, HTML or a public repository |
+| Let the website or app talk to your gateway | Hardcode the key in an APK, IPA or `BuildConfig` of an app you distribute |
+| Restrict the gateway to the few paths you need and to your own site | Build an "open" gateway that forwards anything to anyone |
+| Rotate the key from the dashboard if you suspect it leaked | Reuse one key across many unrelated projects |
 
-### Websites
+```
+Your website / app ──▶ YOUR gateway (holds the key) ──▶ this API
+        ▲                                                   │
+        └──────── titles + media links (no key in them) ◀───┘
+```
 
-Two options:
+**The easiest gateway is a free Cloudflare Worker.** Complete code (path allow-list, origin check, rate limiting, caching) and free alternatives (Vercel, Deno Deploy, Netlify, Node) are in **PROTECT_YOUR_API_KEY.md**.
 
-- **Recommended: call from your backend.** Your server holds the key and passes titles and media links to your front end. No CORS issues, and the key is never exposed.
-- **Call from the browser.** Your site's exact origin (e.g. `https://yoursite.com`) must be allow-listed by us, otherwise you get `403 Origin not allowed`. The key is visible in your page's network tab, so only do this with a key you can rotate.
+Notes by client type:
 
-Media links (`url`, `downloadUrl`, subtitles, images) work **directly in the browser without any key**, so only API calls need to go through your backend. See [Media links](#media-links).
+- **Websites.** Call your gateway from the browser. Call this API directly from the browser only if your site's exact origin (e.g. `https://yoursite.com`) has been allow-listed by us, and even then the key is visible in the network tab.
+- **Native apps.** Native requests carry no browser `Origin`, so there is nothing to allow-list. Don't ship the key inside the app: call your gateway, and give the gateway your own user login or device checks.
+- **Media links** (`url`, `downloadUrl`, subtitles, images) are **not** credentials and play directly on the viewer's device. Only API calls need to go through the gateway. Do **not** route video through it.
 
 ---
 
@@ -335,7 +349,7 @@ TV responses also include `season`, `episode` and `available_seasons`.
 
 ### Facts to build around
 
-- **Format:** `.srt` (SubRip), served from the subtitle host ([hosts](#hosts-you-will-see)). The link is self-authorizing: **no headers or key** needed, and it expires after about 6 hours.
+- **Format:** `.srt` (SubRip), served from the subtitle host ([hosts](#hosts-you-will-see)). The link is self-authorizing: **no headers or key** needed, and it expires after about 3 hours.
 - **Language fields:** `lan` is a code (`en`), `lanName` is the display name (`English`). The official app uses `lan`, falling back to `lanName`, as the language and `lanName`, falling back to `lan`, as the label.
 - **Default track:** the app auto-selects English (`lan == "en"` or `lanName == "English"`) and otherwise starts with subtitles **off**. A subtitle menu lets the user switch tracks or turn them off.
 - **Many titles have no captions.** Nigerian titles typically return an empty list. Treat an empty `captions` array as normal and hide the subtitle button.
@@ -344,7 +358,7 @@ TV responses also include `season`, `episode` and `available_seasons`.
 - **Use `GET`.** Don't probe caption URLs with `HEAD` before using them; it adds a round trip and isn't needed.
 - **`delay` field:** the official app does not apply it. Instead it gives users a manual subtitle-delay control (0 to 15 seconds). Do the same, or apply `delay` yourself if you find it useful.
 - **TV:** pass the real `season` and `episode`. Captions are per episode.
-- **Caching:** the app caches the captions response for 30 minutes (keyed by title + season + episode). The links inside expire in about 6 hours, so don't store them longer.
+- **Caching:** the app caches the captions response for 30 minutes (keyed by title + season + episode). The links inside expire in about 3 hours, so don't store them longer.
 - **Dubs:** captions for a dubbed version are fetched with the dub's own `detailPath`.
 
 ### Using captions
@@ -451,7 +465,7 @@ All paths: `GET https://axis.yocinema.dpdns.org/api/sports/...` with `X-API-Key`
   },
   "status": "live",
   "startTime": "2026-10-31T15:00:00.000Z", "endTime": null,
-  "liveStream": { "available": true, "url": "https://…/index.m3u8", "format": "hls", "authorized": true },
+  "liveStream": { "available": true, "format": "hls" },
   "streams": [],
   "replay": [],
   "highlights": [ { "id": "…", "title": "Goal 12'", "url": "https://…", "cover": "https://…", "durationSeconds": 42, "createdAt": "…" } ]
@@ -460,7 +474,7 @@ All paths: `GET https://axis.yocinema.dpdns.org/api/sports/...` with `X-API-Key`
 
 - `status`: `scheduled`, `live`, `finished`, `postponed`, `cancelled`. Treat anything else as unknown.
 - `score` is a number or `null`. `logo` is **omitted** when there is none, so use a placeholder.
-- **Can the viewer watch live?** Only when `status == "live"` **and** `liveStream.available == true` **and** `liveStream.url` is non-empty. Otherwise don't show a Watch button.
+- **Live matches:** `status == "live"` with `liveStream.available == true` means a live feed exists. **Live playback is not currently offered to third-party apps and websites**, so show live matches as information (score, time, status) and don't build a Watch button for them.
 - `streams` is always empty. Ignore it.
 - `replay` and `highlights` are often empty. Don't render tabs or buttons for empty lists.
 - Optional fields may also appear (`statusLive`, `timeDesc`, `leagueLogo`, `teamMatchInfo`, `result`). Ignore anything you don't need.
@@ -471,62 +485,40 @@ On opening Sports (and on pull-to-refresh) it makes three requests in parallel:
 
 | Request | Used for |
 |---|---|
-| `live` (all pages: `limit=50`, follow `nextCursor` until `hasMore` is false) | **Live** tab. Sorted: playable matches first, then by kickoff. |
+| `live` (all pages: `limit=50`, follow `nextCursor` until `hasMore` is false) | **Live** tab, sorted by kickoff |
 | `schedule?limit=60` | **Fixtures**: only `status == scheduled`, sorted by kickoff |
 | `media?days=3&limit=40` | **Replays** (finished with a `replay`) and **Highlights** (has `highlights`, excluded if already shown under Replays) |
 
 - A league filter chip re-runs the feed with `leagueId=<id>`. League list: `leagues`, cached 1 hour.
 - **Polling:** only while at least one match is live, re-fetch every **30 seconds** and flash any match whose score changed. Stop polling when nothing is live or the screen is hidden. Poll failures are silent. Keep showing the last good data.
-- **Playing a match:** `live` match → `liveStream.url`. Finished match → `replay[0].url`, otherwise `highlights[0].url`. The match-detail page lists every replay and highlight clip.
+- **Playing a clip:** finished match → `replay[0].url`, otherwise `highlights[0].url`. The match-detail page lists every replay and highlight clip.
 - **Match details:** `GET /api/sports/events/:id` (cached about 45 seconds).
 
-### Playing sports media
+### Replays and highlights
 
-| Media | Playback |
-|---|---|
-| Replays and highlights | Play the `url` directly. No special headers. |
-| **Live** (`liveStream.url`, HLS `.m3u8`) | The live provider rejects requests that don't carry a browser-like identity. See below. |
-
-**Native apps (live):** send these headers on the playlist **and** segment requests:
-
-```
-Referer: https://sportsnow.top/
-Origin: https://sportsnow.top
-User-Agent: Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36
-```
-
-The official app does this only for live hosts (`*.aisports.mobi`, and `lacdn.aoneroom.com` manifests), never for replays or highlights. In ExoPlayer: `DefaultHttpDataSource.Factory().setDefaultRequestProperties(headers)` or `OkHttpDataSource` with those headers.
-
-```kotlin
-val headers = mapOf(
-    "Referer" to "https://sportsnow.top/",
-    "Origin" to "https://sportsnow.top",
-    "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-)
-val factory = DefaultHttpDataSource.Factory().setDefaultRequestProperties(headers)
-val source = HlsMediaSource.Factory(factory).createMediaSource(MediaItem.fromUri(liveUrl))
-```
-
-**Websites (live):** browsers do not allow pages to set `Referer`, `Origin` or `User-Agent`, so a plain `<video>` or hls.js player cannot play live matches directly. Replays and highlights work normally. For live in a browser, contact us ([Support](#support)) to discuss options. Note that anything routed through the API's own proxy counts **every** playlist and segment request against your daily limit.
+`replay[].url` and `highlights[].url` are normal video links: give them directly to a `<video>` element or a native player. No headers, keys or special setup are needed. Use `cover` as the thumbnail and `durationSeconds` for the length label.
 
 ---
 
 ## Media links
 
-Every playable or displayable link in a response (`url`, `downloadUrl`, covers, banners, avatars, trailers, subtitles) is an **opaque link that works on its own**. Treat it as a string you pass to a player or `<img>`.
+Every playable or displayable link in a response (`url`, `downloadUrl`, covers, banners, avatars, trailers, subtitles) is a **ready-to-use link**. Treat it as a string you pass to a player or `<img>`.
 
 - **No headers or key** are needed on these links.
-- **They expire** (about 6 hours for video, downloads and subtitles; about 24 hours for images). Don't store them. Store `detailPath` (+ season/episode) and fetch fresh links on play. The official app caches stream responses for only **60 seconds**.
-- **If playback fails** with 403/404 midway, request fresh links and resume at the same position.
+- **They expire.** Playback links last roughly the length of the title plus 30 minutes (between 1 and 5 hours), download links 2 hours, subtitles 3 hours, images 24 hours. Don't store them. Store `detailPath` (+ season/episode) and fetch fresh links when the viewer presses play. The official app caches stream responses for only **60 seconds**.
+- **They are for the viewer who asked for them.** Each link is tied to the API key that requested it, is rate-limited, and may stop working if it is used from many different places. Sharing links publicly, or using one link for many viewers, can get your key suspended. Request a link per viewer, at play time.
+- **If playback fails** with 403/404/410/429 midway, request fresh links and resume at the same position.
 - **Image caching:** the same cover returns a **different link** on each API response, so URL-based caches never hit. Use a stable cache key such as `subject:<subjectId>:cover` (the official app uses this pattern with Coil: `diskCacheKey` / `memoryCacheKey`). On the web, cache by `subjectId` in your own store.
-- **Don't parse or modify** links. Anyone holding a link can use it until it expires.
-- **Sports media** (live streams, replays, highlights, logos) are normal provider URLs, not the opaque links above, so they are used as returned.
+- **Don't parse or modify** links.
+- **Replay and highlight links** (sports) are used exactly as returned.
 
 ---
 
 ## Code examples
 
 ### Kotlin: Retrofit + OkHttp
+
+> The example below shows the request shape. In a distributed app, point `baseUrl` at **your own gateway** (which adds the key) instead of putting the key in the app. See [Protect your API key](#protect-your-api-key).
 
 ```kotlin
 class ApiKeyInterceptor(private val key: () -> String?) : Interceptor {
@@ -563,7 +555,7 @@ val client = OkHttpClient.Builder()
     .build()
 
 val api = Retrofit.Builder()
-    .baseUrl("https://axis.yocinema.dpdns.org/")
+    .baseUrl("https://YOUR-GATEWAY.example.workers.dev/") // your gateway, not the API directly
     .client(client)
     .addConverterFactory(MoshiConverterFactory.create())
     .build().create(DemoApi::class.java)
@@ -610,7 +602,7 @@ const caps = await api(`/api/captions/${path}`).catch(() => ({ captions: [] }));
 
 // Sports: live now
 const live = await api("/api/sports/live?limit=50");
-const watchable = live.items.filter(m => m.status === "live" && m.liveStream?.available && m.liveStream.url);
+const liveNow = live.items.filter(m => m.status === "live"); // show score/time; live playback is not offered
 ```
 
 ### Web player (non-sports)
