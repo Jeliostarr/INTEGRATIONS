@@ -655,3 +655,6 @@ For key access, enabling non-translated/Nigerian content, higher limits or websi
 - Telegram: <https://t.me/jeliostarrdev>
 - WhatsApp: <https://wa.me/256707934960>
 - Dashboard: <https://dash.yocinema.dpdns.org>
+- Official Referenced App:<https://yoapps.cc.cd>
+- Official Referenced Website:
+<https://yostream.cc.cd>
