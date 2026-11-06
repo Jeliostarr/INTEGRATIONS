@@ -77,6 +77,7 @@ Be defensive when parsing: read `error`, then fall back to `message`, then to `d
 | 403 | `Origin not allowed` | Browser origin not allow-listed | See [websites](#apps-vs-websites) |
 | 429 | | Daily request limit reached | Wait for reset or upgrade |
 | 429 | *(from a media link)* | That link was used too often or from too many places | Request a fresh link from the API. Don't share links. |
+| 410 | `Link expired` | A media link (including a live stream URL) was used past its expiry | Re-fetch the endpoint that produced the link. For live streams, re-fetch `GET /api/sports/events/:id`. |
 | 503 | `Verification busy` | Our key check is briefly overloaded | Retry after the `Retry-After` seconds |
 | 400 | | Bad or missing parameter | Fix the request |
 | 404 | | Title / event / video not found | Show "not available" |
@@ -120,6 +121,7 @@ Notes by client type:
 |---|---|
 | **API (this guide)** | `https://axis.yocinema.dpdns.org` |
 | Video & downloads | `https://stream.yocinema.dpdns.org` |
+| Sports live streams (relay) | `https://cdn.jeliostarrdev.qzz.io` |
 | Subtitles | `https://edge.jeliostarrdev.qzz.io` |
 | Images (covers, avatars, banners) | `https://cdn.yocinema.dpdns.org` / `https://cdn.jeliostarrdev.qzz.io` |
 
@@ -465,7 +467,7 @@ All paths: `GET https://axis.yocinema.dpdns.org/api/sports/...` with `X-API-Key`
   },
   "status": "live",
   "startTime": "2026-10-31T15:00:00.000Z", "endTime": null,
-  "liveStream": { "available": true, "format": "hls" },
+  "liveStream": { "available": true, "format": "hls", "url": "https://cdn.jeliostarrdev.qzz.io/m/<token>", "authorized": true },
   "streams": [],
   "replay": [],
   "highlights": [ { "id": "…", "title": "Goal 12'", "url": "https://…", "cover": "https://…", "durationSeconds": 42, "createdAt": "…" } ]
@@ -474,10 +476,14 @@ All paths: `GET https://axis.yocinema.dpdns.org/api/sports/...` with `X-API-Key`
 
 - `status`: `scheduled`, `live`, `finished`, `postponed`, `cancelled`. Treat anything else as unknown.
 - `score` is a number or `null`. `logo` is **omitted** when there is none, so use a placeholder.
-- **Live matches:** `status == "live"` with `liveStream.available == true` means a live feed exists. **Live playback is not currently offered to third-party apps and websites**, so show live matches as information (score, time, status) and don't build a Watch button for them.
+- **Live matches:** `status == "live"` with `liveStream.available == true` means a live feed exists. `liveStream.url` is a **self-authorizing relay link** (`https://cdn.jeliostarrdev.qzz.io/m/<token>`) valid for about 5 minutes. Hand it directly to your player — **no headers, no referer, no key**. The relay supplies everything the upstream CDN requires.
+  - **While a match is live, re-fetch `GET /api/sports/events/:id` every 30–60 seconds** to get a fresh `liveStream.url`. The old one expires.
+  - If `liveStream.url` is `null` on a `status: "live"` match, live streaming isn't enabled for your key yet — contact support.
+  - **List endpoints (`/live`, `/schedule`) never include a live URL.** Only the single-match endpoint returns one, so you must call `events/:id` to get it.
 - `streams` is always empty. Ignore it.
 - `replay` and `highlights` are often empty. Don't render tabs or buttons for empty lists.
 - Optional fields may also appear (`statusLive`, `timeDesc`, `leagueLogo`, `teamMatchInfo`, `result`). Ignore anything you don't need.
+- `liveStream.url` only appears on `GET /api/sports/events/:id` (never on list endpoints), and only when your key is allowed to stream. `authorized` mirrors that. On list endpoints the field is `{ "available": true/false }` with `url` absent or `null`.
 
 ### How the official app builds its sports feed
 
@@ -492,11 +498,39 @@ On opening Sports (and on pull-to-refresh) it makes three requests in parallel:
 - A league filter chip re-runs the feed with `leagueId=<id>`. League list: `leagues`, cached 1 hour.
 - **Polling:** only while at least one match is live, re-fetch every **30 seconds** and flash any match whose score changed. Stop polling when nothing is live or the screen is hidden. Poll failures are silent. Keep showing the last good data.
 - **Playing a clip:** finished match → `replay[0].url`, otherwise `highlights[0].url`. The match-detail page lists every replay and highlight clip.
+- **Playing a live match:** `GET /api/sports/events/:id` while `status == "live"`, use `item.liveStream.url`. Re-fetch every 30–60s while playing.
 - **Match details:** `GET /api/sports/events/:id` (cached about 45 seconds).
 
-### Replays and highlights
+### Replays, highlights and live streams
 
 `replay[].url` and `highlights[].url` are normal video links: give them directly to a `<video>` element or a native player. No headers, keys or special setup are needed. Use `cover` as the thumbnail and `durationSeconds` for the length label.
+
+`liveStream.url` (only returned from `GET /api/sports/events/:id`) is a self-authorizing relay link (`https://cdn.jeliostarrdev.qzz.io/m/<token>`). Treat it exactly like a replay URL: pass it to your player, no headers needed. Two differences:
+
+- It **expires after about 5 minutes**. Re-fetch the event to get a new one.
+- It only exists on the single-match endpoint. List endpoints give you the match info but never the live URL.
+
+```js
+// Live player loop (browser or native)
+let currentUrl = null;
+
+async function tick() {
+  const { item } = await api(`/api/sports/events/${matchId}`);
+  if (item.status !== "live" || !item.liveStream?.url) {
+    player.pause();
+    return;
+  }
+  if (item.liveStream.url !== currentUrl) {
+    currentUrl = item.liveStream.url;
+    const t = player.currentTime();
+    player.load(currentUrl);         // or player.src = currentUrl
+    player.seekTo(t);                // resume at the same position
+  }
+}
+
+setInterval(tick, 30_000);           // re-fetch every 30s while live
+tick();
+```
 
 ---
 
@@ -505,12 +539,13 @@ On opening Sports (and on pull-to-refresh) it makes three requests in parallel:
 Every playable or displayable link in a response (`url`, `downloadUrl`, covers, banners, avatars, trailers, subtitles) is a **ready-to-use link**. Treat it as a string you pass to a player or `<img>`.
 
 - **No headers or key** are needed on these links.
-- **They expire.** Playback links last roughly the length of the title plus 30 minutes (between 1 and 5 hours), download links 2 hours, subtitles 3 hours, images 24 hours. Don't store them. Store `detailPath` (+ season/episode) and fetch fresh links when the viewer presses play. The official app caches stream responses for only **60 seconds**.
+- **They expire.** Playback links last roughly the length of the title plus 30 minutes (between 1 and 5 hours), download links 2 hours, subtitles 3 hours, images 24 hours, **live sports stream links about 5 minutes**. Don't store them. Store `detailPath` (+ season/episode) and fetch fresh links when the viewer presses play. The official app caches stream responses for only **60 seconds**.
 - **They are for the viewer who asked for them.** Each link is tied to the API key that requested it, is rate-limited, and may stop working if it is used from many different places. Sharing links publicly, or using one link for many viewers, can get your key suspended. Request a link per viewer, at play time.
 - **If playback fails** with 403/404/410/429 midway, request fresh links and resume at the same position.
 - **Image caching:** the same cover returns a **different link** on each API response, so URL-based caches never hit. Use a stable cache key such as `subject:<subjectId>:cover` (the official app uses this pattern with Coil: `diskCacheKey` / `memoryCacheKey`). On the web, cache by `subjectId` in your own store.
 - **Don't parse or modify** links.
 - **Replay and highlight links** (sports) are used exactly as returned.
+- **Live stream links** (sports) are used exactly as returned, but re-requested every 30–60 seconds while the match is live (see [Sports](#sports)).
 
 ---
 
@@ -600,9 +635,16 @@ const q = (stream.qualities ?? [])
   .sort((a, b) => (b.resolution ?? 0) - (a.resolution ?? 0))[0] ?? stream.best_free;
 const caps = await api(`/api/captions/${path}`).catch(() => ({ captions: [] }));
 
-// Sports: live now
+// Sports: list live matches (info only — no URL here)
 const live = await api("/api/sports/live?limit=50");
-const liveNow = live.items.filter(m => m.status === "live"); // show score/time; live playback is not offered
+const liveNow = live.items.filter(m => m.status === "live");
+
+// To actually play one, ask for the single match:
+const { item } = await api(`/api/sports/events/${liveNow[0].id}`);
+if (item.liveStream?.url) {
+  player.src = item.liveStream.url;  // no headers, plays directly
+  // re-fetch /api/sports/events/:id every 30s while live to refresh the URL
+}
 ```
 
 ### Web player (non-sports)
@@ -632,7 +674,8 @@ Every request counts toward your key's daily limit, so cache. These TTLs are wha
 | Captions response | 30 minutes |
 | **Stream / quality links** (`movie`, `tv`) | **60 seconds** (links expire) |
 | Sports leagues | 1 hour |
-| Sports live | 20 seconds |
+| Sports live (list) | 20 seconds |
+| Sports live **stream URL** (`events/:id`) | **30 seconds while playing** (the URL itself expires in ~5 minutes) |
 | Sports schedule | 3 minutes |
 | Sports replays/highlights (`media`) | 10 minutes |
 | Sports single match | 45 seconds |
@@ -655,6 +698,5 @@ For key access, enabling non-translated/Nigerian content, higher limits or websi
 - Telegram: <https://t.me/jeliostarrdev>
 - WhatsApp: <https://wa.me/256707934960>
 - Dashboard: <https://dash.yocinema.dpdns.org>
-- Official Referenced App:<https://yoapps.cc.cd>
-- Official Referenced Website:
-<https://yostream.cc.cd>
+- Official Referenced App: <https://yoapps.cc.cd>
+- Official Referenced Website: <https://yostream.cc.cd>
