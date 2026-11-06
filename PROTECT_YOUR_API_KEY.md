@@ -30,7 +30,7 @@ The fix is simple: **keep the key on a server you control and let your website o
 - The **key never reaches the browser or the app**. It lives in the gateway as a secret.
 - The gateway only forwards a short list of endpoints, so it can't be used as a general-purpose proxy.
 - Responses for lists and details are cached in the gateway, which also **saves your daily quota**.
-- Media links in the responses (video, subtitles, images) are **not credentials**. They play directly on the viewer's device and never pass through your gateway.
+- Media links in the responses (video, subtitles, images, live streams) are **not credentials**. They play directly on the viewer's device and never pass through your gateway.
 
 ### What each layer stops
 
@@ -115,7 +115,10 @@ const ROUTES = [
   { re: /^\/api\/(details|seasons)\/[A-Za-z0-9._~%-]{1,200}$/, ttl: 1800 },
   { re: /^\/api\/(movie|tv|captions)\/[A-Za-z0-9._~%-]{1,200}$/, ttl: 0, heavy: true },
   { re: /^\/api\/sports\/(leagues|live|schedule|media|replays)$/, ttl: 30 },
-  { re: /^\/api\/sports\/events\/\d{1,20}$/, ttl: 0 },
+  // events/:id is re-fetched every 30s by live viewers. ttl:25 dedupes all viewers
+  // of one match down to one upstream request per 25s — the returned liveStream.url
+  // is valid for ~5 min, so a 25s cache never serves an expired link.
+  { re: /^\/api\/sports\/events\/\d{1,20}$/, ttl: 25 },
 ];
 
 const ALLOWED_PARAMS = new Set([
@@ -245,7 +248,14 @@ export default {
       console.error("API rejected the gateway key:", upstream.status, await upstream.text().catch(() => ""));
       return json(502, { error: "Service unavailable" }, cors);
     }
-    if (upstream.status === 429) return json(429, { error: "Busy, try again later" }, { ...cors, "Retry-After": "30" });
+    // 429 here means YOUR gateway key's daily quota is exhausted, not the visitor's.
+    // Tell the operator so they don't blame the API.
+    if (upstream.status === 429) {
+      console.error("Gateway key hit its daily limit — quota exhausted");
+      return json(429, {
+        error: "Gateway quota exhausted. If you run this gateway, check your key's daily limit.",
+      }, { ...cors, "Retry-After": "60" });
+    }
 
     const out = new Response(upstream.body, {
       status: upstream.status,
@@ -321,6 +331,12 @@ Retrofit.Builder()
 
 Apps send no `Origin` header, so set `ALLOW_NO_ORIGIN = "true"` in `wrangler.toml` **and** turn on signed sessions (below), otherwise anyone who finds your gateway address could use it.
 
+### Live sports streams
+
+Live match URLs are **short-lived** (about 5 minutes) and only returned by the single-match endpoint. Re-fetch `GET /api/sports/events/:id` every 30–60 seconds while a match is live, and hand the returned `liveStream.url` to your player. The gateway's default `ttl: 25` on that route means all viewers of one match share one upstream request per 25 seconds — the token is valid for ~5 minutes, so a 25s cache never serves an expired link.
+
+The relay behind `liveStream.url` is designed to serve many viewers on one token (it skips the per-link rate limit for live streams), so caching the response is safe and saves a lot of quota.
+
 ---
 
 ## Make the gateway harder to abuse
@@ -389,7 +405,7 @@ Any place that can run a little server-side code and keep a secret works. The lo
 |---|---|---|---|
 | **Cloudflare Workers** | Yes | `wrangler secret put` | Full example above (rate limit + cache built in) |
 | **Cloudflare Pages Functions** | Yes | Project settings → Variables and Secrets | Same code as the Worker in `functions/` |
-| **Vercel Functions** | Yes (hobby) | Project → Settings → Environment Variables | Example below |
+| **Vercel Functions** | Yes (hobby) | Project → Settings → Environment Variables | Example below — **needs a rate limiter**, see the warning |
 | **Deno Deploy** | Yes | Project → Settings → Environment Variables | Example below |
 | **Netlify Functions** | Yes | Site settings → Environment variables | Same logic as the Vercel example |
 | **Supabase Edge Functions** | Yes | `supabase secrets set` | Same logic as the Deno example |
@@ -402,6 +418,9 @@ Free tiers change, so check each provider's current limits.
 Save as `api/yocinema/[...path].js`. Call it as `/api/yocinema/search?q=test` from your site.
 
 ```js
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
 const API = "https://axis.yocinema.dpdns.org/api/";
 const ALLOWED = [
   /^(home|trending|search|catalog|browse)$/,
@@ -413,9 +432,23 @@ const PARAMS = new Set(["q","mode","limit","page","type","genre","country","year
   "rankingId","query","season","episode","cursor","leagueId","sport","date","from","to","days"]);
 const ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
 
+// Per-visitor rate limit. 60 requests per minute per IP.
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(60, "60 s"),
+});
+
 export default async function handler(req, res) {
   const origin = req.headers.origin;
   if (req.method !== "GET" || !origin || !ORIGINS.includes(origin)) return res.status(403).json({ error: "Forbidden" });
+
+  // Rate limit BEFORE forwarding. Without this, one script drains your quota.
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || "unknown";
+  const { success, reset } = await ratelimit.limit(ip);
+  if (!success) {
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((reset - Date.now()) / 1000))));
+    return res.status(429).json({ error: "Too many requests" });
+  }
 
   const path = [].concat(req.query.path || []).join("/");
   if (!ALLOWED.some((re) => re.test(path))) return res.status(404).json({ error: "Not found" });
@@ -430,7 +463,14 @@ export default async function handler(req, res) {
   const r = await fetch(API + path + (qs.size ? "?" + qs : ""), {
     headers: { "X-API-Key": process.env.YOCINEMA_API_KEY, Accept: "application/json" },
   });
-  if (r.status === 401 || r.status === 403) return res.status(502).json({ error: "Service unavailable" });
+  if (r.status === 401 || r.status === 403) {
+    console.error("API rejected the gateway key:", r.status);
+    return res.status(502).json({ error: "Service unavailable" });
+  }
+  if (r.status === 429) {
+    console.error("Gateway key hit its daily limit");
+    return res.status(429).json({ error: "Gateway quota exhausted." });
+  }
 
   const playLinks = /^(movie|tv|captions)\//.test(path);
   res.setHeader("Access-Control-Allow-Origin", origin);
@@ -440,7 +480,9 @@ export default async function handler(req, res) {
 }
 ```
 
-Set `YOCINEMA_API_KEY` and `ALLOWED_ORIGINS` as environment variables. Vercel has no built-in per-visitor rate limit on the free plan, so add one (for example with a free Upstash Redis limiter, or the Vercel Firewall).
+Set `YOCINEMA_API_KEY`, `ALLOWED_ORIGINS`, `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` as environment variables.
+
+> ⚠️ **The Vercel example above uses Upstash Redis for rate limiting.** Vercel has no built-in per-visitor rate limit on the free plan, so the Upstash limiter is **required** — without it, one script can drain your key's daily quota in a minute. Before you deploy this example, create a free database at <https://console.upstash.com> and copy the two env vars. **If you skip this step, do not put the gateway in front of a public site.**
 
 ### Deno Deploy example
 
@@ -464,6 +506,7 @@ Deno.serve(async (req) => {
     headers: { "X-API-Key": Deno.env.get("YOCINEMA_API_KEY")!, Accept: "application/json" },
   });
   if (r.status === 401 || r.status === 403) return new Response("Service unavailable", { status: 502 });
+  if (r.status === 429) return new Response("Gateway quota exhausted", { status: 429 });
 
   return new Response(r.body, {
     status: r.status,
@@ -477,7 +520,7 @@ Deno.serve(async (req) => {
 });
 ```
 
-This short version forwards the query string as-is. For the stricter parameter allow-list, copy the `ALLOWED_PARAMS` check from the Worker.
+This short version forwards the query string as-is. For the stricter parameter allow-list, copy the `ALLOWED_PARAMS` check from the Worker. Deno Deploy has no built-in rate limit on the free plan — add one (for example with Upstash, same as the Vercel example) before going public.
 
 ---
 
@@ -491,6 +534,8 @@ Use the links from the API responses **directly in the player**. Do not route vi
 
 Request a link **when the viewer presses play** (one link per viewer), because links expire and are tied to your key. See *Media links* in the integration guide.
 
+**Live sports streams are the one exception to "one link per viewer"** — the relay is designed to serve many viewers on one live token, and the gateway caches `events/:id` for 25 seconds so all viewers of a match share one upstream request. See *Live sports streams* under [Calling the gateway](#calling-the-gateway).
+
 ---
 
 ## Checklist
@@ -502,6 +547,7 @@ Request a link **when the viewer presses play** (one link per viewer), because l
 - [ ] Turnstile and/or signed sessions are on if your project is public or paid
 - [ ] `.dev.vars`, `.env` and similar files are in `.gitignore`
 - [ ] Video is played from the returned links, not proxied
+- [ ] Live matches re-fetch `events/:id` every 30–60s, and the gateway caches it for ~25s
 - [ ] You know how to rotate your key (dashboard) and update the secret
 
 ## If your key leaks
